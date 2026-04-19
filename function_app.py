@@ -5,6 +5,7 @@ for the Smart Building Energy Optimiser Dashboard.
 """
 import os
 import json
+import random
 import smtplib
 import threading
 import logging
@@ -43,6 +44,7 @@ last_email_time = None
 
 # Anomaly log (in-memory, survives hot reloads)
 anomaly_log: list[dict] = []
+auth_cache = {}
 
 
 # ----------------------------------------------------
@@ -108,10 +110,10 @@ def get_severity(actual: float, predicted: float) -> str:
 # ----------------------------------------------------
 # EMAIL FUNCTION
 # ----------------------------------------------------
-def send_email_alert(actual: float, predicted: float, time_label: str, severity: str):
+def send_email_alert(actual: float, predicted: float, time_label: str, severity: str, dynamic_receiver: str = None):
     sender   = os.environ.get("EMAIL_SENDER")
     password = os.environ.get("EMAIL_PASSWORD")
-    receiver = os.environ.get("EMAIL_RECEIVER")
+    receiver = dynamic_receiver or os.environ.get("EMAIL_RECEIVER")
 
     if not sender or not password or not receiver:
         logger.warning("Email config missing — skipping alert")
@@ -160,9 +162,95 @@ Smart Building Energy Optimiser
 # ----------------------------------------------------
 def cors(response: func.HttpResponse) -> func.HttpResponse:
     response.headers["Access-Control-Allow-Origin"]  = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Allow-Headers"] = "Content-Type"
     return response
+
+
+# ----------------------------------------------------
+# AUTHENTICATION
+# ----------------------------------------------------
+@app.route(route="AuthRequest", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
+def auth_request(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS": return cors(func.HttpResponse("", status_code=200))
+    try:
+        body = req.get_json()
+        email = body.get("email")
+        if not email:
+            return cors(func.HttpResponse(json.dumps({"error": "Email required"}), status_code=400))
+
+        otp = str(random.randint(100000, 999999))
+        auth_cache[email] = {
+            "otp": otp,
+            "expires": datetime.now() + timedelta(minutes=10)
+        }
+
+        sender   = os.environ.get("EMAIL_SENDER")
+        password = os.environ.get("EMAIL_PASSWORD")
+
+        smtp_ok = False
+        if sender and password:
+            try:
+                msg = MIMEMultipart()
+                msg["From"]    = sender
+                msg["To"]      = email
+                msg["Subject"] = f"EnergyPulse Verification Code: {otp}"
+                body_text = (
+                    f"Your EnergyPulse access code is: {otp}\n"
+                    "This code expires in 10 minutes.\n\nPlease do not share this."
+                )
+                msg.attach(MIMEText(body_text, "plain"))
+
+                server = smtplib.SMTP("smtp.gmail.com", 587)
+                server.starttls()
+                server.login(sender, password)
+                server.sendmail(sender, email, msg.as_string())
+                server.quit()
+                smtp_ok = True
+                logger.info(f"Auth OTP sent to {email}")
+            except Exception as smtp_err:
+                logger.warning(f"SMTP failed (dev-mode fallback active): {smtp_err}")
+
+        # ── Dev-mode fallback: return OTP in response when SMTP is unavailable ──
+        if smtp_ok:
+            return cors(func.HttpResponse(
+                json.dumps({"success": True}),
+                mimetype="application/json"
+            ))
+        else:
+            logger.info(f"[DEV] OTP for {email}: {otp}")
+            return cors(func.HttpResponse(
+                json.dumps({"success": True, "dev_otp": otp,
+                            "dev_note": "SMTP unavailable — OTP returned for local dev only"}),
+                mimetype="application/json"
+            ))
+
+    except Exception as e:
+        logger.error(f"Auth request error: {e}")
+        return cors(func.HttpResponse(
+            json.dumps({"error": "Internal server error"}), status_code=500
+        ))
+
+@app.route(route="AuthVerify", auth_level=func.AuthLevel.ANONYMOUS, methods=["POST", "OPTIONS"])
+def auth_verify(req: func.HttpRequest) -> func.HttpResponse:
+    if req.method == "OPTIONS": return cors(func.HttpResponse("", status_code=200))
+    try:
+        body = req.get_json()
+        email, otp = body.get("email"), body.get("otp")
+        cached = auth_cache.get(email)
+        
+        if not cached:
+            return cors(func.HttpResponse(json.dumps({"error": "No pending request/expired"}), status_code=400))
+        if datetime.now() > cached["expires"]:
+             return cors(func.HttpResponse(json.dumps({"error": "OTP expired"}), status_code=400))
+        if str(cached["otp"]) != str(otp):
+             return cors(func.HttpResponse(json.dumps({"error": "Invalid Validation Code"}), status_code=400))
+             
+        del auth_cache[email]
+        logger.info(f"Auth successful for {email}")
+        return cors(func.HttpResponse(json.dumps({"verified": True}), mimetype="application/json"))
+    except Exception as e:
+        return cors(func.HttpResponse(json.dumps({"error": str(e)}), status_code=500))
 
 
 # ----------------------------------------------------
@@ -347,6 +435,7 @@ def predict(req: func.HttpRequest) -> func.HttpResponse:
 def detect_anomaly(req: func.HttpRequest) -> func.HttpResponse:
     if req.method == "OPTIONS":
         return cors(func.HttpResponse("", status_code=200))
+    receiver_email = req.params.get("receiver_email")
 
     global current_index, last_alert_signature, last_email_time
 
@@ -407,6 +496,7 @@ def detect_anomaly(req: func.HttpRequest) -> func.HttpResponse:
                         latest["predicted"],
                         latest["timestamp"],
                         latest["severity"],
+                        receiver_email
                     )
                 ).start()
                 last_alert_signature = signature
